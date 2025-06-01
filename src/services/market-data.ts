@@ -3,22 +3,42 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { BN } from '@coral-xyz/anchor';
 import Big from 'big.js';
 import { SolanaService } from './solana';
+import { HistoricalDataService } from './historical-data';
+import { MetricsService } from './metrics';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 import { getErrorMessage } from '../utils/error';
-import { PoolData, TokenInfo, BinData, MarketData, MarketTrend, TradingOpportunity, TrendDirection, OpportunityType, RiskLevel } from '../types';
+import { 
+  PoolData, 
+  TokenInfo, 
+  BinData, 
+  MarketData, 
+  MarketTrend, 
+  TradingOpportunity, 
+  TrendDirection, 
+  OpportunityType, 
+  RiskLevel,
+  HistoricalDataPoint,
+  TimeFrame,
+  PoolMetrics,
+  BinLiquidity
+} from '../types';
 
 export class MarketDataService {
   private solanaService: SolanaService;
   private connection: Connection;
   private poolCache: Map<string, PoolData> = new Map();
   private dlmmInstances: Map<string, DLMM> = new Map();
+  private historicalService: HistoricalDataService;
+  private metricsService: MetricsService;
   private lastUpdate: Date = new Date(0);
   private updateInterval: number = 30000; // 30 seconds
 
   constructor(solanaService: SolanaService) {
     this.solanaService = solanaService;
     this.connection = solanaService.getConnection();
+    this.historicalService = new HistoricalDataService();
+    this.metricsService = new MetricsService();
   }
 
   async initialize(): Promise<void> {
@@ -87,60 +107,174 @@ export class MarketDataService {
     logger.info('Removed pool', { poolAddress });
   }
 
+  private async updateHistoricalData(poolAddress: string, dlmm: DLMM): Promise<void> {
+    try {
+      const currentData = await this.getCurrentDataPoint(poolAddress, dlmm);
+      await this.historicalService.addDataPoint(poolAddress, currentData, TimeFrame.HOURLY);
+    } catch (error) {
+      logger.error('Failed to update historical data', { error: getErrorMessage(error), poolAddress });
+    }
+  }
+
+  private async getCurrentDataPoint(poolAddress: string, dlmm: DLMM): Promise<HistoricalDataPoint> {
+    const activeBin = await dlmm.getActiveBin();
+    const bins = await dlmm.getBinsAroundActiveBin(1, 1);
+    const currentBin = bins.bins.find(bin => bin.binId === activeBin.binId);
+
+    if (!currentBin) {
+      throw new Error(`Bin not found: ${activeBin.binId}`);
+    }
+
+    const feeInfo = dlmm.getFeeInfo();
+    const swapFee = new Big(feeInfo.swapFeeRate || 0);
+
+    return {
+      timestamp: new Date(),
+      price: new Big(activeBin.price),
+      volume: new Big(currentBin.xAmount).add(new Big(currentBin.yAmount)),
+      fees: swapFee,
+      liquidityX: new Big(currentBin.xAmount),
+      liquidityY: new Big(currentBin.yAmount),
+      binId: activeBin.binId
+    };
+  }
+
+  private async calculatePoolMetrics(
+    poolAddress: string,
+    hourlyData: HistoricalDataPoint[],
+    currentLiquidity: Big
+  ): Promise<PoolMetrics> {
+    const volume24h = this.metricsService.calculateVolume24h(hourlyData);
+    const fees24h = this.metricsService.calculateFees24h(hourlyData);
+    const apr = this.metricsService.calculateAPR(fees24h, currentLiquidity);
+    
+    // Get price history for volatility calculation
+    const priceHistory = hourlyData.map(point => point.price);
+    const volatility = this.metricsService.calculateVolatility(priceHistory);
+
+    // Calculate IL from initial price to current (if we have enough history)
+    const initialPrice = hourlyData[0]?.price || new Big(0);
+    const currentPrice = hourlyData[hourlyData.length - 1]?.price || new Big(0);
+    const impermanentLoss = this.metricsService.calculateImpermanentLoss(initialPrice, currentPrice);
+
+    // Get liquidity distribution metrics
+    const binData = hourlyData.map(point => ({
+      liquidityX: point.liquidityX,
+      liquidityY: point.liquidityY
+    }));
+    const liquidityMetrics = this.metricsService.getLiquidityDistribution(binData);
+
+    return {
+      volume24h,
+      fees24h,
+      apr,
+      volatility,
+      impermanentLoss,
+      liquidityMetrics
+    };
+  }
+
+  async getBinLiquidityData(poolAddress: string): Promise<BinLiquidity[]> {
+    try {
+      const dlmm = this.dlmmInstances.get(poolAddress);
+      if (!dlmm) {
+        throw new Error(`Pool not found: ${poolAddress}`);
+      }
+
+      const binArrays = await dlmm.getBinArrays();
+      const activeBin = await dlmm.getActiveBin();
+      const binStep = await dlmm.getBinStep();
+
+      const binLiquidityData: BinLiquidity[] = [];
+      
+      for (const binArray of binArrays) {
+        for (const bin of binArray.account.bins) {
+          if (!bin.liquidityX.isZero() || !bin.liquidityY.isZero()) {
+            const priceX = this.metricsService.calculateBinPrice(
+              bin.binId,
+              binStep,
+              new Big(activeBin.price)
+            );
+
+            binLiquidityData.push({
+              liquidity: new Big(bin.liquidityX.add(bin.liquidityY).toString()),
+              supplyX: new Big(bin.liquidityX.toString()),
+              supplyY: new Big(bin.liquidityY.toString()),
+              priceX,
+              binId: bin.binId,
+              isActive: bin.binId === activeBin.binId
+            });
+          }
+        }
+      }
+
+      return binLiquidityData.sort((a, b) => a.binId - b.binId);
+    } catch (error) {
+      logger.error('Failed to get bin liquidity data', { error: getErrorMessage(error), poolAddress });
+      return [];
+    }
+  }
+
   private async updatePoolData(poolAddress: string, dlmm: DLMM): Promise<void> {
     try {
-      // Refresh DLMM state
+      // Refresh all state data
       await dlmm.refetchStates();
       
-      // Get active bin
+      // Get pool parameters and state
+      const parameters = await dlmm.getParameters();
       const activeBin = await dlmm.getActiveBin();
-      
-      // Get fee info
-      const feeInfo = dlmm.getFeeInfo();
+      const binArrayStates = await dlmm.getBinArrays();
+      const feeInfo = await dlmm.getFeeInfo();
       
       // Get token information
-      const tokenX = dlmm.tokenX;
-      const tokenY = dlmm.tokenY;
+      const [tokenXData, tokenYData] = await Promise.all([
+        this.getTokenInfo(dlmm.tokenX),
+        this.getTokenInfo(dlmm.tokenY)
+      ]);
       
-      // Calculate liquidity and volume (simplified)
-      const bins = await dlmm.getBinsAroundActiveBin(10, 10);
-      let totalLiquidity = new Big(0);
-      
-      for (const bin of bins.bins) {
-        const binLiquidity = new Big(bin.xAmount.toString()).add(new Big(bin.yAmount.toString()));
-        totalLiquidity = totalLiquidity.add(binLiquidity);
-      }
-      
-      // Create pool data
+      // Calculate metrics using actual data from SDK
+      const hourlyData = await this.historicalService.getLast24HourData(poolAddress);
+      const volatilityAcc = await dlmm.getVolatilityAccumulator();
+
       const poolData: PoolData = {
         address: poolAddress,
         tokenX: {
-          address: tokenX.publicKey.toString(),
-          symbol: 'TOKEN_X', // DLMM SDK doesn't expose symbol directly
-          decimals: tokenX.mint.decimals,
+          address: dlmm.tokenX.publicKey.toString(),
+          symbol: 'TOKEN_X',
+          decimals: dlmm.tokenX.mint.decimals,
           price: new Big(activeBin.price),
-          supply: new Big(0) // Would need additional API call
+          supply: new Big(0)
         },
         tokenY: {
-          address: tokenY.publicKey.toString(),
-          symbol: 'TOKEN_Y', // DLMM SDK doesn't expose symbol directly
-          decimals: tokenY.mint.decimals,
-          price: new Big(1), // Relative to tokenX
-          supply: new Big(0) // Would need additional API call
+          address: dlmm.tokenY.publicKey.toString(),
+          symbol: 'TOKEN_Y',
+          decimals: dlmm.tokenY.mint.decimals,
+          price: new Big(1),
+          supply: new Big(0)
         },
         activeId: activeBin.binId,
         activeBin: {
           binId: activeBin.binId,
           price: new Big(activeBin.price),
-          liquidityX: new Big(0), // Would need bin-specific data
-          liquidityY: new Big(0), // Would need bin-specific data
+          liquidityX: new Big(0),
+          liquidityY: new Big(0),
           totalLiquidity: new Big(0)
         },
-        liquidity: totalLiquidity,
-        volume24h: new Big(0), // Would need historical data
-        fees24h: new Big(0), // Would need historical data
-        apr: 0, // Would need calculation
-        volatility: 0, // Would need historical price data
+        liquidity: new Big(0),
+        binArray: binLiquidityData,
+        priceData: {
+          activeId: activeBin.binId,
+          activePrice: new Big(activeBin.price),
+          binStep,
+          compositePrice: new Big(compositePrices.composite)
+        },
+        metrics: await this.calculatePoolMetrics(
+          poolAddress,
+          hourlyData,
+          binLiquidityData,
+          feeData,
+          volatilityAcc
+        ),
         lastUpdated: new Date()
       };
       
@@ -150,7 +284,13 @@ export class MarketDataService {
         poolAddress, 
         activeBinId: activeBin.binId,
         price: activeBin.price,
-        liquidity: totalLiquidity.toString()
+        liquidity: totalLiquidity.toString(),
+        metrics: {
+          volume24h: metrics.volume24h.toString(),
+          fees24h: metrics.fees24h.toString(),
+          apr: metrics.apr,
+          volatility: metrics.volatility
+        }
       });
     } catch (error) {
       logger.error('Failed to update pool data', { error: getErrorMessage(error), poolAddress });
@@ -459,6 +599,7 @@ export class MarketDataService {
   }
 
   async cleanup(): Promise<void> {
-    await this.close();
+    await this.historicalService.cleanup();
+    await this.historicalService.close();
   }
 }

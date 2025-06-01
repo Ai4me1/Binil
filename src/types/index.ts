@@ -51,14 +51,30 @@ export interface PoolData {
   address: string;
   tokenX: TokenInfo;
   tokenY: TokenInfo;
-  activeId: number;
-  activeBin: BinData;
-  liquidity: Big;
-  volume24h: Big;
-  fees24h: Big;
-  apr: number;
-  volatility: number;
+  parameters: DLMMParameters;
+  activeBin: {
+    binId: number;
+    price: Big;
+    state: BinState;
+  };
+  binArrays: BinArrayState[];
+  metrics: PoolMetrics;
   lastUpdated: Date;
+}
+
+export interface TokenMetadata {
+  name: string;
+  symbol: string;
+  logoURI?: string;
+  website?: string;
+  description?: string;
+  tags?: string[];
+}
+
+export interface TokenSupplyInfo {
+  totalSupply: Big;
+  circulatingSupply: Big;
+  lastUpdate: Date;
 }
 
 export interface TokenInfo {
@@ -67,6 +83,12 @@ export interface TokenInfo {
   decimals: number;
   price: Big;
   supply: Big;
+  metadata: TokenMetadata;
+  supplyInfo: TokenSupplyInfo;
+  priceHistory: {
+    timestamp: Date;
+    price: Big;
+  }[];
 }
 
 export interface BinData {
@@ -75,6 +97,48 @@ export interface BinData {
   liquidityX: Big;
   liquidityY: Big;
   totalLiquidity: Big;
+}
+
+export interface LiquidityMetrics {
+  concentrationIndex: number;  // 0-1, higher means more concentrated
+  liquidityRatio: number;     // Ratio of Y to X liquidity
+}
+
+export interface DLMMParameters {
+  binStep: number;
+  baseFactor: number;
+  maxVolatilityAccumulator: number;
+  maxFee: number;
+  protocolShare: number;
+}
+
+export interface BinState {
+  amountX: Big;
+  amountY: Big;
+  price: Big;
+  liquiditySupply: Big;
+}
+
+export interface BinArrayState {
+  startBinId: number;
+  totalBins: number;
+  bins: {
+    [binId: number]: BinState;
+  };
+}
+
+// Updated metrics to match SDK data
+export interface PoolMetrics {
+  volume24h: Big;
+  fees24h: Big;
+  tvl: Big;
+  apr: number;
+  volatility: number;
+  binUtilization: number;
+  liquidityDistribution: {
+    concentrationIndex: number;
+    binCount: number;
+  };
 }
 
 // Position Management
@@ -340,6 +404,29 @@ export interface DbPerformance {
   impermanentLoss: string;
   activePositions: number;
   dailyReturn: string;
+}
+
+// Historical data interfaces
+export enum TimeFrame {
+  HOURLY = 'hourly',
+  DAILY = 'daily',
+  WEEKLY = 'weekly'
+}
+
+export interface HistoricalDataPoint {
+  timestamp: Date;
+  price: Big;
+  volume: Big;
+  fees: Big;
+  liquidityX: Big;
+  liquidityY: Big;
+  binId: number;
+}
+
+export interface PoolHistoricalData {
+  hourly: HistoricalDataPoint[];
+  daily: HistoricalDataPoint[];
+  weekly: HistoricalDataPoint[];
 }
 
 // Utility Types
